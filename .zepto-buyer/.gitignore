@@ -1,0 +1,85 @@
+# API Keys and Credentials - CRITICAL
+config.py
+*.env
+*.env.local
+.env
+.env.local
+.env.*.local
+
+# Secrets and sensitive data
+secrets.json
+credentials.json
+private_key.*
+
+# Logs and temporary files
+*.log
+zepto_buyer.log
+debug*.log
+*.tmp
+temp/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+
+# Local development files
+*.backup
+local_*
+test_*.py
+debug_*.py
+find_*.py
+
+# Data files that may contain sensitive information
+history.json
+*.db
+*.sqlite
+*.sqlite3
+database.db
+
+# OS files
+Thumbs.db
+.DS_Store
+.env.prod
+
+# Project-specific
+zepto_cache/
+cache/
+.claude/
+scheduled_tasks.lock
