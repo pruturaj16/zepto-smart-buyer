@@ -1,7 +1,7 @@
 import requests, os, sys, json, time
+from config import TELEGRAM_TOKEN, CHAT_ID
 
-TOKEN   = "8656045080:AAE2v57ofYXgI8kmk9X9hpArQXOzySm01Og"
-CHAT_ID = "8788121945"
+TOKEN   = TELEGRAM_TOKEN
 BASE    = f"https://api.telegram.org/bot{TOKEN}"
 
 def send_alert(sku_name, current_price, historical_low, threshold, qty):
