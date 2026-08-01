@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timezone
 
 from config import WATCHLIST_PATH
+from gcs_sync import push_state
 
 
 def _parse_qty(qty) -> int:
@@ -84,6 +85,7 @@ def save_watchlist(data: dict) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, WATCHLIST_PATH)
+    push_state()
 
 
 def add_sku(name: str, qty, sku_id: str) -> dict:

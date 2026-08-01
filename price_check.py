@@ -17,6 +17,7 @@ from watchlist import (
     append_cart_total, get_best_previous_total
 )
 from zepto_mcp import search_product, search_products_batch
+from gcs_sync import pull_state
 
 # Try importing direct (free) MCP client — falls back to Anthropic if unavailable
 try:
@@ -224,6 +225,7 @@ def fetch_all_prices(skus: list) -> dict:
 def run():
     logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Starting price check...")
 
+    pull_state()
     data = load_watchlist()
 
     if not data["skus"]:

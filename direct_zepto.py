@@ -8,38 +8,19 @@ Used by price_check.py for price fetches (free).
 Install requirements (run once on Windows):
     pip install mcp httpx
 
-Token: read from ~/.mcp-auth/ same as zepto_mcp.py
+Token: auto-refreshed via zepto_auth.py, same as zepto_mcp.py.
 """
 
 import asyncio
 import json
 import logging
-import glob
-import os
+
+from config import ZEPTO_LATITUDE, ZEPTO_LONGITUDE, ZEPTO_STORE_ID
+from zepto_auth import get_valid_token as get_cached_token
 
 logger = logging.getLogger(__name__)
 
 ZEPTO_MCP_URL = "https://mcp.zepto.co.in/mcp"
-MCP_AUTH_DIR  = os.path.join(os.path.expanduser("~"), ".mcp-auth")
-
-
-# ── Token helpers (shared with zepto_mcp.py) ─────────────────────────────────
-
-def get_cached_token() -> str | None:
-    if not os.path.exists(MCP_AUTH_DIR):
-        return None
-    token_files = glob.glob(os.path.join(MCP_AUTH_DIR, "**", "*_tokens.json"), recursive=True)
-    if not token_files:
-        token_files = glob.glob(os.path.join(MCP_AUTH_DIR, "**", "*.json"), recursive=True)
-    for path in token_files:
-        try:
-            with open(path, "r") as f:
-                data = json.load(f)
-            if "access_token" in data:
-                return data["access_token"]
-        except Exception:
-            continue
-    return None
 
 
 # ── Core async MCP caller ─────────────────────────────────────────────────────
@@ -48,6 +29,10 @@ async def _call_tool_async(tool_name: str, arguments: dict, token: str):
     """
     Open a single MCP session, call one tool, return the raw result object.
     Uses streamable HTTP transport (mcp >= 1.6).
+
+    Zepto scopes shopping context (store, cart) to the MCP session, so every
+    fresh session needs select_store before any product/cart tool will work
+    ("Error: Store not selected.").
     """
     from mcp import ClientSession
     from mcp.client.streamable_http import streamablehttp_client
@@ -57,6 +42,12 @@ async def _call_tool_async(tool_name: str, arguments: dict, token: str):
     async with streamablehttp_client(ZEPTO_MCP_URL, headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            if tool_name != "select_store":
+                await session.call_tool("select_store", {
+                    "storeId": ZEPTO_STORE_ID,
+                    "latitude": ZEPTO_LATITUDE,
+                    "longitude": ZEPTO_LONGITUDE,
+                })
             result = await session.call_tool(tool_name, arguments)
 
     return result
@@ -105,12 +96,7 @@ def call_tool(tool_name: str, arguments: dict) -> str:
     (e.g. price_check.py, direct_zepto.py __main__ test).
     From bot.py always use the async versions below.
     """
-    token = get_cached_token()
-    if not token:
-        raise RuntimeError(
-            "No Zepto OAuth token found in ~/.mcp-auth/\n"
-            "Fix: open Claude Desktop and run one Zepto search to refresh the token."
-        )
+    token  = get_cached_token()
     result = asyncio.run(_call_tool_async(tool_name, arguments, token))
     return _extract_text(result)
 
@@ -152,16 +138,33 @@ def _parse_markdown_product(text: str) -> dict:
     return {"price": price, "in_stock": in_stock}
 
 
-def get_product_price(sku_id: str) -> dict | None:
+def get_product_price(sku_id: str, max_retries: int = 3) -> dict | None:
     """
     Fetch current price and stock status for a known SKU ID directly.
     Returns {sku_id, price, in_stock} or None on failure.
     No LLM involved — 100% free.
+
+    Zepto rate-limits (429 "Too Many Requests") under heavy batch use, e.g.
+    price_check.py fetching a whole watchlist every 2 hours. Retry with
+    backoff rather than treating a rate limit as a permanent failure.
     """
+    delay = 3
     try:
-        token  = get_cached_token()
-        result = asyncio.run(_call_tool_async("get_product_details", {"product_variant_id": sku_id}, token))
-        raw    = _extract_text(result)
+        token = get_cached_token()
+        for attempt in range(max_retries + 1):
+            result = asyncio.run(_call_tool_async("get_product_details", {"product_variant_id": sku_id}, token))
+            raw    = _extract_text(result)
+
+            if "Too Many Requests" in raw:
+                if attempt < max_retries:
+                    logger.warning(f"[Direct] Rate-limited fetching {sku_id} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                    import time
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                logger.error(f"[Direct] Still rate-limited fetching {sku_id} after all retries")
+                return None
+            break
 
         if not raw:
             logger.error(f"[Direct] Empty response for {sku_id}")
@@ -182,6 +185,64 @@ def get_product_price(sku_id: str) -> dict | None:
     except Exception as e:
         logger.error(f"[Direct] Failed to fetch price for {sku_id}: {e}")
         return None
+
+
+async def get_product_details_async(sku_id: str, token: str, max_retries: int = 3) -> dict | None:
+    """
+    Fetch full product details for one SKU directly (no LLM) — used by the
+    Telegram picker flow, which needs an image URL per candidate.
+    Returns {sku_id, name, price, in_stock, image_url} or None on failure.
+
+    get_product_details returns structured JSON (with an "images" array) when
+    available; falls back to markdown text parsing (no image) otherwise.
+    """
+    delay = 3
+    for attempt in range(max_retries + 1):
+        result = await _call_tool_async("get_product_details", {"product_variant_id": sku_id}, token)
+
+        structured = getattr(result, "structuredContent", None)
+        if structured:
+            images = structured.get("images") or []
+            return {
+                "sku_id":    sku_id,
+                "name":      structured.get("name"),
+                "price":     structured.get("sellingPrice", 0) / 100 if structured.get("sellingPrice") else None,
+                "in_stock":  bool(structured.get("isInStock", True)),
+                "image_url": images[0] if images else None,
+            }
+
+        raw = _extract_text(result)
+
+        if "Too Many Requests" in raw:
+            if attempt < max_retries:
+                logger.warning(f"[Direct] Rate-limited fetching details for {sku_id} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            logger.error(f"[Direct] Still rate-limited fetching details for {sku_id} after all retries")
+            return None
+
+        if not raw:
+            logger.error(f"[Direct] Empty details response for {sku_id}")
+            return None
+
+        parsed = _parse_markdown_product(raw)
+        if parsed["price"] is None:
+            logger.error(f"[Direct] Could not extract details for {sku_id}. Raw: {raw[:200]}")
+            return None
+
+        import re
+        image_match = re.search(r"https://cdn\.zeptonow\.com\S+", raw)
+
+        return {
+            "sku_id":    sku_id,
+            "name":      None,
+            "price":     parsed["price"],
+            "in_stock":  parsed["in_stock"],
+            "image_url": image_match.group(0) if image_match else None,
+        }
+
+    return None
 
 
 def get_prices_batch(skus: list) -> dict:
@@ -243,8 +304,6 @@ async def resolve_items_with_gemini(items: list) -> dict:
     model = genai.GenerativeModel("gemini-2.0-flash")
 
     token = get_cached_token()
-    if not token:
-        raise RuntimeError("No Zepto OAuth token found. Re-authenticate via Claude Desktop.")
 
     success, failed = [], []
 
