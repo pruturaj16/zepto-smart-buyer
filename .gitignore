@@ -68,6 +68,7 @@ find_*.py
 
 # Data files that may contain sensitive information
 history.json
+order_context.txt
 *.db
 *.sqlite
 *.sqlite3

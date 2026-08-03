@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, handlers=[_log_handler_file, _log_handle
 from watchlist import (
     load_watchlist, save_watchlist,
     append_price, compute_cart_total, get_latest_price,
-    append_cart_total, get_best_previous_total
+    append_cart_total, get_best_previous_total, record_alert_sent
 )
 from zepto_mcp import search_product, search_products_batch
 from gcs_sync import pull_state
@@ -223,6 +223,20 @@ def fetch_all_prices(skus: list) -> dict:
 # ── Main run loop ─────────────────────────────────────────────────────────────
 
 def run():
+    try:
+        _run_price_check()
+    finally:
+        # Recompute dashboard metrics on every run (even if the price check
+        # above exited early or raised) — order/alert data can change
+        # independently of whether this particular check found a drop.
+        try:
+            from metrics import write_metrics
+            write_metrics()
+        except Exception as e:
+            logging.error(f"[Metrics] write_metrics failed: {e}")
+
+
+def _run_price_check():
     logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Starting price check...")
 
     pull_state()
@@ -326,6 +340,7 @@ def run():
                 alerted = send_alert(current_total, prev_oos_total, prev_oos_at, cart["items"])
                 if alerted:
                     data["last_alerted_at"] = datetime.now(timezone.utc).isoformat()
+                    record_alert_sent(drop)
             else:
                 logging.info(f"  Drop ₹{round(drop)} below ₹{DROP_THRESHOLD} threshold — no alert.")
         else:
@@ -372,6 +387,7 @@ def run():
                 # Reset the comparison window so we don't re-alert every run
                 data["last_alerted_at"] = datetime.now(timezone.utc).isoformat()
                 save_watchlist(data)
+                record_alert_sent(drop)
         else:
             logging.info(f"  Drop ₹{round(drop)} below ₹{DROP_THRESHOLD} threshold — no alert.")
 

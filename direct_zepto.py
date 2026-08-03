@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 
-from config import ZEPTO_LATITUDE, ZEPTO_LONGITUDE, ZEPTO_STORE_ID
+from config import ZEPTO_LATITUDE, ZEPTO_LONGITUDE, ZEPTO_STORE_ID, ZEPTO_MCP_DEBUG
 from zepto_auth import get_valid_token as get_cached_token
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,14 @@ async def _call_tool_async(tool_name: str, arguments: dict, token: str):
                     "longitude": ZEPTO_LONGITUDE,
                 })
             result = await session.call_tool(tool_name, arguments)
+
+    if ZEPTO_MCP_DEBUG:
+        logger.info(
+            f"[MCP-DEBUG] {tool_name}({arguments}) -> "
+            f"isError={getattr(result, 'isError', None)} "
+            f"structuredContent={getattr(result, 'structuredContent', None)} "
+            f"text={_extract_text(result)[:2000]}"
+        )
 
     return result
 
@@ -88,6 +96,53 @@ def _extract_text(result) -> str:
         return json.dumps(result.__dict__)
     except Exception:
         return str(result)
+
+
+async def call_tool_with_retry(tool_name: str, arguments: dict, token: str, max_retries: int = 3):
+    """
+    Generic direct (no-LLM) Zepto MCP tool call with 429 retry/backoff.
+    Returns the raw MCP result object (use _extract_text / .structuredContent
+    to read it), or None if still rate-limited after all retries.
+
+    This is the single execution primitive for zepto_agent.py's tool-calling
+    pipeline — every Zepto MCP call it makes goes through here, so retry
+    behavior and rate-limit handling live in exactly one place.
+
+    A 429 can surface two different ways: embedded in a normal MCP response
+    (handled below via the text check) or as a raw transport-level exception
+    during the session handshake (httpx.HTTPStatusError, seen in practice —
+    build_order_context.py's page-14 request crashed the whole script this
+    way before this except clause was added). Both are retried identically.
+    """
+    delay = 3
+    for attempt in range(max_retries + 1):
+        try:
+            result = await _call_tool_async(tool_name, arguments, token)
+        except Exception as e:
+            if attempt < max_retries:
+                logger.warning(f"[Direct] {tool_name} raised {type(e).__name__} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s... ({e})")
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            logger.error(f"[Direct] {tool_name} still failing after all retries: {e}")
+            return None
+
+        if getattr(result, "structuredContent", None):
+            return result  # structured content is never the rate-limit error text
+
+        raw = _extract_text(result)
+        if "Too Many Requests" in raw:
+            if attempt < max_retries:
+                logger.warning(f"[Direct] Rate-limited on {tool_name} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2
+                continue
+            logger.error(f"[Direct] Still rate-limited on {tool_name} after all retries")
+            return None
+
+        return result
+
+    return None
 
 
 def call_tool(tool_name: str, arguments: dict) -> str:
@@ -185,64 +240,6 @@ def get_product_price(sku_id: str, max_retries: int = 3) -> dict | None:
     except Exception as e:
         logger.error(f"[Direct] Failed to fetch price for {sku_id}: {e}")
         return None
-
-
-async def get_product_details_async(sku_id: str, token: str, max_retries: int = 3) -> dict | None:
-    """
-    Fetch full product details for one SKU directly (no LLM) — used by the
-    Telegram picker flow, which needs an image URL per candidate.
-    Returns {sku_id, name, price, in_stock, image_url} or None on failure.
-
-    get_product_details returns structured JSON (with an "images" array) when
-    available; falls back to markdown text parsing (no image) otherwise.
-    """
-    delay = 3
-    for attempt in range(max_retries + 1):
-        result = await _call_tool_async("get_product_details", {"product_variant_id": sku_id}, token)
-
-        structured = getattr(result, "structuredContent", None)
-        if structured:
-            images = structured.get("images") or []
-            return {
-                "sku_id":    sku_id,
-                "name":      structured.get("name"),
-                "price":     structured.get("sellingPrice", 0) / 100 if structured.get("sellingPrice") else None,
-                "in_stock":  bool(structured.get("isInStock", True)),
-                "image_url": images[0] if images else None,
-            }
-
-        raw = _extract_text(result)
-
-        if "Too Many Requests" in raw:
-            if attempt < max_retries:
-                logger.warning(f"[Direct] Rate-limited fetching details for {sku_id} (attempt {attempt + 1}/{max_retries}), retrying in {delay}s...")
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-            logger.error(f"[Direct] Still rate-limited fetching details for {sku_id} after all retries")
-            return None
-
-        if not raw:
-            logger.error(f"[Direct] Empty details response for {sku_id}")
-            return None
-
-        parsed = _parse_markdown_product(raw)
-        if parsed["price"] is None:
-            logger.error(f"[Direct] Could not extract details for {sku_id}. Raw: {raw[:200]}")
-            return None
-
-        import re
-        image_match = re.search(r"https://cdn\.zeptonow\.com\S+", raw)
-
-        return {
-            "sku_id":    sku_id,
-            "name":      None,
-            "price":     parsed["price"],
-            "in_stock":  parsed["in_stock"],
-            "image_url": image_match.group(0) if image_match else None,
-        }
-
-    return None
 
 
 def get_prices_batch(skus: list) -> dict:

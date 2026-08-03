@@ -8,7 +8,7 @@ import json
 import logging
 import time
 import anthropic
-from config import ANTHROPIC_API_KEY, ZEPTO_STORE_ID, ZEPTO_LATITUDE, ZEPTO_LONGITUDE
+from config import ANTHROPIC_API_KEY, ZEPTO_STORE_ID, ZEPTO_LATITUDE, ZEPTO_LONGITUDE, ZEPTO_MCP_DEBUG
 from zepto_auth import get_valid_token as get_cached_token
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,12 @@ def call_zepto_mcp(prompt: str, system: str, max_retries: int = 3) -> str:
             messages=[{"role": "user", "content": prompt}],
             betas=["mcp-client-2025-04-04"]
         )
+
+        if ZEPTO_MCP_DEBUG:
+            # Full response includes mcp_tool_use / mcp_tool_result content
+            # blocks — the actual Zepto responses Claude saw, not just the
+            # final text Claude chose to return.
+            logger.info(f"[MCP-DEBUG] raw response: {response.model_dump_json()[:4000]}")
 
         if "Too Many Requests" in response.model_dump_json():
             if attempt < max_retries:
@@ -112,27 +118,6 @@ def parse_json(raw: str) -> dict:
 
     # Last resort: parse whole string
     return json.loads(raw)
-
-
-def find_candidates(name: str, limit: int = 3) -> list:
-    """
-    Search Zepto for a product and return up to `limit` candidate matches
-    (sku_id + name only) instead of auto-picking one — used by the Telegram
-    picker flow so the user selects the exact SKU instead of the bot guessing.
-    Raises ZeptoRateLimited if Zepto is still rate-limited after retries.
-    """
-    raw = call_zepto_mcp(
-        prompt=f"Search for this product: {name}",
-        system=(
-            "You are a product search agent. Search for the given product using search_products. "
-            f"Return up to {limit} of the best matching results, ranked best match first. "
-            "Return ONLY a JSON object with exactly this key:\n"
-            "- candidates: array of {sku_id (string), name (string)}\n"
-            "The JSON must be inside a ```json code block. No other text after the code block."
-        )
-    )
-    result = parse_json(raw)
-    return result.get("candidates", [])[:limit]
 
 
 def search_product(name: str) -> dict:
@@ -246,50 +231,6 @@ def add_to_cart(skus: list) -> dict:
         logger.error(f"[Cart] ❌ Failed to parse cart response: {e}")
         logger.error(f"[Cart] Full response: {raw}")
         raise
-
-
-def remove_from_cart(item_names: list | None = None, remove_all: bool = False) -> dict:
-    """
-    Remove items from the live Zepto cart via update_cart (quantity=0) —
-    Zepto's MCP has no separate "remove" tool; per their docs, removal is
-    just update_cart with quantity set to 0.
-
-    item_names: substrings to match against current cart item names.
-    remove_all: if True, clears the entire cart regardless of item_names.
-    Returns {"removed": [...], "not_found": [...]}
-    """
-    if remove_all:
-        prompt = "Remove ALL items from the cart."
-        system = (
-            "You are a cart management agent. First call view_cart to see the current cart. "
-            "Then call update_cart with quantity=0 for every item currently in the cart, "
-            "to remove them all. Do NOT call place_order or create_order. "
-            "Return ONLY a JSON object with key 'removed' (array of item names that were removed). "
-            "The JSON must be inside a ```json code block. No other text after the code block."
-        )
-    else:
-        name_lines = "\n".join(f"- {n}" for n in item_names)
-        prompt = f"Remove these items from the cart:\n{name_lines}"
-        system = (
-            "You are a cart management agent. First call view_cart to see the current cart. "
-            "For each requested item below, find the best matching item currently in the cart by name, "
-            "then call update_cart with quantity=0 for that item's productVariantId and storeProductId "
-            "to remove it. If a requested item isn't in the cart, list it as not found instead. "
-            "Do NOT call place_order or create_order. "
-            "Return ONLY a JSON object with keys: "
-            "'removed' (array of item names removed), 'not_found' (array of requested names not in cart). "
-            "The JSON must be inside a ```json code block. No other text after the code block."
-        )
-
-    try:
-        raw = call_zepto_mcp(prompt=prompt, system=system)
-    except ZeptoRateLimited:
-        return {"removed": [], "not_found": item_names or [], "rate_limited": True}
-
-    result = parse_json(raw)
-    result.setdefault("removed", [])
-    result.setdefault("not_found", [])
-    return result
 
 
 def add_to_cart_and_order(skus: list) -> dict:

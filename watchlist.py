@@ -26,6 +26,7 @@ def load_watchlist() -> dict:
             "cart_total_history": [],
             "last_alerted_at": None,
             "pending_oos_prompt": None,
+            "alerts": [],
             "skus": []
         }
         save_watchlist(data)
@@ -53,6 +54,7 @@ def load_watchlist() -> dict:
     data.setdefault("last_alerted_at",   None)
     data.setdefault("pending_oos_prompt", None)
     data.setdefault("previous_check_at", None)
+    data.setdefault("alerts", [])
 
     # ── Normalize per-SKU history entries (handle camelCase + missing keys) ──
     for sku in data.get("skus", []):
@@ -142,6 +144,41 @@ def append_price(sku_id: str, price: float | None, in_stock: bool) -> None:
                 sku["history"] = sku["history"][-100:]
             break
     save_watchlist(data)
+
+
+def record_alert_sent(drop_amount: float) -> None:
+    """
+    Log that a price-drop alert was sent, with outcome "pending" until the
+    user taps a button. Used to compute the dashboard's alert conversion
+    rate (acted vs. skipped vs. never responded).
+    """
+    data = load_watchlist()
+    data.setdefault("alerts", []).append({
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "drop":    round(drop_amount, 2),
+        "outcome": "pending",
+        "resolved_at": None
+    })
+    # Keep at most 500 alert records
+    if len(data["alerts"]) > 500:
+        data["alerts"] = data["alerts"][-500:]
+    save_watchlist(data)
+
+
+def resolve_pending_alert(outcome: str) -> None:
+    """
+    Mark the most recent "pending" alert as acted-on or skipped, called from
+    bot.py's Yes/Skip callback. No-op if there's no pending alert (e.g. the
+    callback is unrelated, or the alert already resolved/expired).
+    """
+    data = load_watchlist()
+    alerts = data.get("alerts", [])
+    for alert in reversed(alerts):
+        if alert["outcome"] == "pending":
+            alert["outcome"] = outcome
+            alert["resolved_at"] = datetime.now(timezone.utc).isoformat()
+            save_watchlist(data)
+            return
 
 
 def append_cart_total(

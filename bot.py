@@ -1,6 +1,4 @@
-import json
 import logging
-import re
 import uuid
 from datetime import datetime, timezone
 
@@ -14,17 +12,16 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN, LOG_PATH
-from parse_list import parse_shopping_list
 from watchlist import (
     load_watchlist, save_watchlist,
-    add_sku, remove_sku, compute_cart_total, get_latest_price
+    add_sku, remove_sku, compute_cart_total, get_latest_price,
+    resolve_pending_alert
 )
-from zepto_mcp import find_candidates, add_to_cart, add_to_cart_and_order, remove_from_cart, ZeptoRateLimited
-from direct_zepto import get_product_details_async
+from zepto_mcp import add_to_cart, add_to_cart_and_order
+import zepto_agent
 from zepto_auth import get_valid_token as get_cached_token
-from gcs_sync import pull_state
+from gcs_sync import pull_state, pull_blob
 
-import os
 _log_handler_file    = logging.FileHandler(LOG_PATH, encoding="utf-8")
 _log_handler_console = logging.StreamHandler()
 _log_fmt = logging.Formatter("%(asctime)s — %(levelname)s — %(message)s")
@@ -134,68 +131,42 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-# ── Free text — shopping list parser ─────────────────────────────────────────
+# ── Free text — routed through zepto_agent's plan/execute/analyze pipeline ──
 
-CANDIDATES_PER_ITEM = 3
-
-
-async def _send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, item_name: str, qty) -> None:
+async def _send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, item_name: str, qty, candidates: list) -> None:
     """
-    Search for `item_name`, fetch candidate SKUs with images, and send a
-    photo album + a "which one?" button prompt. Never auto-picks a SKU —
-    a vague name (e.g. "bread") can silently resolve to the wrong product,
-    so the user always confirms the exact SKU themselves.
+    Send a photo album of pre-fetched candidate SKUs + a "which one?" button
+    prompt. Never auto-picks a SKU — a vague name (e.g. "bread") can
+    silently resolve to the wrong product, so the user always confirms the
+    exact SKU themselves. Candidates already carry price/image/stock from
+    the search results (via zepto_agent) — no extra Zepto call needed here.
     """
-    try:
-        candidates = find_candidates(item_name, limit=CANDIDATES_PER_ITEM)
-    except ZeptoRateLimited:
-        await update.message.reply_text(
-            f"❌ {item_name} — Zepto is busy right now, try again in a minute"
+    media = [
+        InputMediaPhoto(
+            media=c["image_url"],
+            caption=f"{i + 1}. {c['name']}\n"
+                    f"₹{c['price']}" + ("" if c["in_stock"] else " (out of stock)")
         )
-        return
-    except Exception as e:
-        logging.error(f"[Picker] Search failed for '{item_name}': {e}")
-        await update.message.reply_text(f"❌ {item_name} — search failed, try again")
-        return
+        for i, c in enumerate(candidates)
+        if c.get("image_url")
+    ]
 
-    if not candidates:
-        await update.message.reply_text(f"❌ {item_name} — not found on Zepto")
-        return
-
-    # Fetch details sequentially (not gathered) — Zepto's search API is already
-    # prone to 429s under load; firing 3 detail requests at once per item would
-    # make that worse.
-    token = get_cached_token()
-    details = []
-    for c in candidates:
-        d = await get_product_details_async(c["sku_id"], token)
-        if d and d.get("image_url"):
-            details.append(d)
-
-    if not details:
+    if not media:
         await update.message.reply_text(f"❌ {item_name} — couldn't load product images, try again")
         return
 
-    media = [
-        InputMediaPhoto(
-            media=d["image_url"],
-            caption=f"{i + 1}. {d['name'] or item_name}\n"
-                    f"₹{d['price']}" + ("" if d["in_stock"] else " (out of stock)")
-        )
-        for i, d in enumerate(details)
-    ]
     await update.message.reply_media_group(media=media)
 
     req_id = uuid.uuid4().hex[:8]
     context.user_data.setdefault("pending_picks", {})[req_id] = {
         "item_name": item_name,
         "qty":       qty,
-        "candidates": details,
+        "candidates": candidates,
     }
 
     buttons = [
         InlineKeyboardButton(str(i + 1), callback_data=f"pick:{req_id}:{i}")
-        for i in range(len(details))
+        for i in range(len(candidates))
     ]
     buttons.append(InlineKeyboardButton("Skip", callback_data=f"pick:{req_id}:skip"))
 
@@ -206,78 +177,80 @@ async def _send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, item_
     )
 
 
-def _parse_cart_removal(text: str) -> dict | None:
-    """
-    Detect "remove X from cart" / "clear my cart" style messages so they're
-    routed to actual Zepto cart removal instead of being misparsed as a
-    shopping-list item to search for and add (the original bug report).
-    Returns {"remove_all": bool, "items": [str]} or None if not a removal intent.
-    """
-    t = text.strip()
-
-    if re.search(r"(?i)\b(clear|empty)\b.*\bcart\b", t) or re.search(r"(?i)\bremove\b.*\ball\b.*\bcart\b", t):
-        return {"remove_all": True, "items": []}
-
-    m = re.match(r"(?i)^(?:remove|delete)\s+(.+?)\s+from\s+(?:my\s+)?cart\s*$", t)
-    if m:
-        items = [i.strip() for i in re.split(r",|\band\b", m.group(1)) if i.strip()]
-        return {"remove_all": False, "items": items}
-
-    return None
-
-
-async def _handle_cart_removal(update: Update, removal: dict) -> None:
-    if removal["remove_all"]:
-        await update.message.reply_text("Removing all items from your Zepto cart...")
-    else:
-        await update.message.reply_text(f"Removing {', '.join(removal['items'])} from your Zepto cart...")
-
-    try:
-        result = remove_from_cart(item_names=removal["items"] or None, remove_all=removal["remove_all"])
-    except Exception as e:
-        logging.error(f"[Bot] Cart removal failed: {e}")
-        await update.message.reply_text(f"Couldn't update the cart. Error: {str(e)}")
+async def _execute_cart_removal(update: Update, cart_items_to_remove: list, cart_not_found: list) -> None:
+    """Removes items from the live Zepto cart via a single batched update_cart(quantity=0) call."""
+    if not cart_items_to_remove:
+        lines = ["Nothing to remove — your cart may already be empty."]
+        if cart_not_found:
+            lines.append("\n*Not found in cart:*")
+            lines += [f"  ❌ {n}" for n in cart_not_found]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
-    if result.get("rate_limited"):
-        await update.message.reply_text("Zepto is busy right now, try again in a minute.")
+    token = get_cached_token()
+    tool_calls = [{
+        "tool": "update_cart",
+        "arguments": {
+            "deviceId": zepto_agent.DEVICE_ID,
+            "cartItems": [
+                {
+                    "productVariantId": item["productVariantId"],
+                    "storeProductId":   item["storeProductId"],
+                    "quantity":         0,
+                }
+                for item in cart_items_to_remove
+            ],
+        },
+    }]
+    results = await zepto_agent.execute_tool_calls(tool_calls, token)
+
+    if "ERROR" in results[0]["result_text"]:
+        logging.error(f"[Bot] Cart removal failed: {results[0]['result_text']}")
+        await update.message.reply_text("Couldn't update the cart — Zepto is busy right now, try again in a minute.")
         return
 
-    lines = []
-    if result["removed"]:
-        lines.append("*Removed from cart:*")
-        lines += [f"  ✅ {n}" for n in result["removed"]]
-    if result["not_found"]:
+    lines = ["*Removed from cart:*"] + [f"  ✅ {item['name']}" for item in cart_items_to_remove]
+    if cart_not_found:
         lines.append("\n*Not found in cart:*")
-        lines += [f"  ❌ {n}" for n in result["not_found"]]
-    if not lines:
-        lines = ["Nothing was removed — your cart may already be empty."]
-
+        lines += [f"  ❌ {n}" for n in cart_not_found]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text.strip()
-
-    removal = _parse_cart_removal(user_text)
-    if removal is not None:
-        await _handle_cart_removal(update, removal)
-        return
-
-    # Parse shopping list locally — no API call needed
-    items = parse_shopping_list(user_text)
-    if not items:
-        await update.message.reply_text(
-            "Couldn't parse that as a shopping list.\n"
-            "Try: _Add Eggoz 30 egg tray, Amul milk 1L x2_",
-            parse_mode="Markdown"
-        )
-        return
-
     await update.message.reply_text("Got it, looking these up on Zepto...")
 
-    for item in items:
-        await _send_picker(update, context, item["name"], item["qty"])
+    try:
+        result = await zepto_agent.run(user_text)
+    except Exception as e:
+        logging.error(f"[Bot] zepto_agent.run failed: {e}")
+        await update.message.reply_text(f"Something went wrong: {str(e)}\nPlease try again.")
+        return
+
+    intent = result.get("intent", "unknown")
+
+    if intent == "add_items":
+        candidates_by_item = result.get("candidates", {})
+        for item_name, candidates in candidates_by_item.items():
+            qty = next(
+                (i["qty"] for i in result.get("items", []) if i["name"].lower() == item_name.lower()),
+                1
+            )
+            await _send_picker(update, context, item_name, qty, candidates)
+        for name in result.get("not_found", []):
+            await update.message.reply_text(f"❌ {name} — not found on Zepto")
+
+    elif intent in ("remove_items", "clear_cart"):
+        await _execute_cart_removal(
+            update, result.get("cart_items_to_remove", []), result.get("cart_not_found", [])
+        )
+
+    else:
+        await update.message.reply_text(
+            "Couldn't understand that as a shopping request.\n"
+            "Try: _Add Eggoz 30 egg tray, Amul milk 1L x2_ or _Remove milk from my cart_",
+            parse_mode="Markdown"
+        )
 
 
 # ── Inline button callbacks — Yes / Skip ─────────────────────────────────────
@@ -310,6 +283,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if query.data == "skip":
+        resolve_pending_alert("skipped")
         data = load_watchlist()
         cart = compute_cart_total(data)
         data["previous_cart_total"] = cart["total"]
@@ -322,6 +296,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if query.data == "yes":
+        resolve_pending_alert("acted")
         await query.message.reply_text("Adding items to your Zepto cart...")
 
         data = load_watchlist()
@@ -369,6 +344,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 def main() -> None:
     pull_state()
+    pull_blob(zepto_agent.CONTEXT_PATH, "order_context.txt")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("list",   list_items))
