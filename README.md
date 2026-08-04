@@ -4,9 +4,8 @@ A Telegram bot that watches your Zepto grocery cart, tells you when prices drop,
 
 ## What it does
 
-- **Natural-language shopping** — text "Add Eggoz 30 egg tray, Amul milk 1L x2" and the bot searches Zepto, shows you photo cards of the actual matching products, and lets you tap the right one before anything is added to your watchlist.
-- **Price-drop alerts** — a scheduled job checks your watchlist's prices every 2 hours (configurable) and messages you when the total drops by ₹50+ (configurable) versus the last time you saw the current basket at that price.
-- **One-tap cart add** — tapping "Add to cart" on an alert adds the discounted items to your real Zepto cart; you still place the order yourself in the Zepto app. This bot does **not** place orders autonomously.
+- **Natural-language shopping** — text "Add Eggoz 30 egg tray, Amul milk 1L x2" and the bot searches Zepto, shows you photo cards of the actual matching products, and lets you tap the right one. Tapping a candidate adds it to both your watchlist and your real Zepto cart immediately.
+- **Price-drop alerts** — a scheduled job checks your watchlist's prices every 2 hours (configurable) and messages you when the total drops by ₹50+ (configurable) versus the last time you saw the current basket at that price. Since your items already live in the Zepto cart, this is an informational nudge to go check out — you still place the order yourself in the Zepto app. This bot does **not** place orders autonomously.
 - **Cart removal by text** — "Remove milk from my cart" or "Clear my cart" resolves against your live Zepto cart and removes the matching items in one call.
 - **Dashboard** — a Cloud Function serves a small metrics page (orders placed, total saved, alert conversion rate, price volatility per item) computed from your real Zepto order history.
 
@@ -57,10 +56,10 @@ graph TB
 
 | File | Role |
 |---|---|
-| `bot.py` | Telegram bot process (always running on `zepto-bot-vm`). Routes free text through `zepto_agent`, handles `/start /list /remove /status`, renders the photo picker, and drives the price-alert Yes/Skip buttons. |
+| `bot.py` | Telegram bot process (always running on `zepto-bot-vm`). Routes free text through `zepto_agent`, handles `/start /list /remove /status`, renders the photo picker, and adds picked candidates to the watchlist + real Zepto cart via `update_cart`. |
 | `zepto_agent.py` | The core shopping pipeline (see below) — turns a free-text message into Zepto MCP calls and a structured result, with no unnecessary tool calls. |
 | `direct_zepto.py` | Raw MCP client (`streamable_http` transport) that calls Zepto's MCP server directly — no LLM in the loop. Owns retry/backoff for rate limits (both in-response 429s and raw transport errors). |
-| `zepto_mcp.py` | Older Anthropic-mediated MCP client (`mcp_servers` beta param). Now only used for the two flows not yet migrated: adding a watchlist item to the real cart after a price-drop alert, and `price_check.py`'s fallback path if `direct_zepto` is unavailable. |
+| `zepto_mcp.py` | Older Anthropic-mediated MCP client (`mcp_servers` beta param). Now only used for `price_check.py`'s fallback path if `direct_zepto` is unavailable. |
 | `build_order_context.py` | One-time/occasional script — paginates `list_order_history` (5s delay between pages) to build a list of your previously-ordered product names, so the planner can match "add milk" to the exact product you usually buy. |
 | `watchlist.py` | Reads/writes `history.json` — tracked SKUs, price history per SKU, cart-total snapshots, alert log. |
 | `price_check.py` | Runs once per invocation on `zepto-price-check-vm`. Fetches current prices, compares against the best valid historical baseline, sends a Telegram alert if the drop clears `DROP_THRESHOLD`. |
@@ -94,6 +93,7 @@ sequenceDiagram
     end
     B->>U: photo cards + "Which one?" buttons
     U->>B: taps a choice
+    B->>Zepto: update_cart(picked item)
     B->>B: add_sku() → history.json → pushed to GCS
 ```
 
@@ -114,7 +114,7 @@ flowchart LR
     D --> E["Fetch prices<br/>(direct MCP, free — no LLM)"]
     E --> F["Compute cart total,<br/>compare to best valid baseline"]
     F --> G{"Drop ≥ DROP_THRESHOLD?"}
-    G -- yes --> H["Telegram alert<br/>+ Add to cart / Skip buttons"]
+    G -- yes --> H["Telegram alert<br/>(informational — items already in cart)"]
     G -- no --> I["Save snapshot, done"]
     H --> I
     I --> J["Recompute dashboard metrics"]
