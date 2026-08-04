@@ -150,15 +150,10 @@ def send_alert(
         f"  As of {prev_label}:  ₹{round(previous_total)}",
         f"  You save:          ₹{drop}",
         f"{'─' * 32}",
-        "\nAdd items to cart?"
+        "\nYour items are already in your Zepto cart — open the app to check out."
     ]
 
-    keyboard = {"inline_keyboard": [[
-        {"text": "🛒 Add to cart", "callback_data": "yes"},
-        {"text": "❌ Skip",        "callback_data": "skip"}
-    ]]}
-
-    result = send_telegram("\n".join(lines), keyboard)
+    result = send_telegram("\n".join(lines))
     if result:
         logging.info(f"  Alert sent — ₹{drop} drop vs {prev_label}")
         return True

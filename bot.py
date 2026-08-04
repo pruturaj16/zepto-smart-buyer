@@ -13,11 +13,9 @@ from telegram.ext import (
 
 from config import TELEGRAM_TOKEN, LOG_PATH
 from watchlist import (
-    load_watchlist, save_watchlist,
+    load_watchlist,
     add_sku, remove_sku, compute_cart_total, get_latest_price,
-    resolve_pending_alert
 )
-from zepto_mcp import add_to_cart, add_to_cart_and_order
 import zepto_agent
 from zepto_auth import get_valid_token as get_cached_token
 from gcs_sync import pull_state, pull_blob
@@ -275,69 +273,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         selected = pending["candidates"][int(choice)]
         name = selected["name"] or pending["item_name"]
         add_sku(name, pending["qty"], selected["sku_id"])
+
+        token = get_cached_token()
+        cart_result = await zepto_agent.execute_tool_calls([{
+            "tool": "update_cart",
+            "arguments": {
+                "deviceId": zepto_agent.DEVICE_ID,
+                "cartItems": [{
+                    "productVariantId": selected["sku_id"],
+                    "storeProductId":   selected["store_product_id"],
+                    "quantity":         pending["qty"],
+                }],
+            },
+        }], token)
+
+        if "ERROR" in cart_result[0]["result_text"]:
+            logging.error(f"[Bot] Cart add failed for {name}: {cart_result[0]['result_text']}")
+            await query.message.reply_text(
+                f"⚠️ Added *{name}* x{pending['qty']} to your watchlist, but couldn't add it to "
+                "your Zepto cart — Zepto is busy right now, try again in a minute.",
+                parse_mode="Markdown"
+            )
+            return
+
         await query.message.reply_text(
-            f"✅ Added *{name}* x{pending['qty']} — ₹{selected['price']} to your watchlist.\n\n"
+            f"✅ Added *{name}* x{pending['qty']} — ₹{selected['price']} to your Zepto cart and watchlist.\n\n"
             "I'll check prices every 2 hours and alert you when the cart drops by ₹50+.",
             parse_mode="Markdown"
         )
         return
 
-    if query.data == "skip":
-        resolve_pending_alert("skipped")
-        data = load_watchlist()
-        cart = compute_cart_total(data)
-        data["previous_cart_total"] = cart["total"]
-        data["previous_check_at"]   = datetime.now(timezone.utc).isoformat()
-        save_watchlist(data)
-        await query.message.reply_text(
-            "Skipped. Baseline updated to current prices.\n"
-            "I'll alert you again when the cart drops another ₹50."
-        )
-        return
-
-    if query.data == "yes":
-        resolve_pending_alert("acted")
-        await query.message.reply_text("Adding items to your Zepto cart...")
-
-        data = load_watchlist()
-        skus_to_add = [
-            s for s in data["skus"]
-            if (latest := get_latest_price(s)) and latest["in_stock"]
-        ]
-
-        if not skus_to_add:
-            await query.message.reply_text("No in-stock items to add to cart.")
-            return
-
-        try:
-            logging.info(f"[Bot] Adding {len(skus_to_add)} items to cart via Anthropic API")
-            cart_result = add_to_cart(skus_to_add)
-            logging.info(f"[Bot] ✅ Cart response: {cart_result}")
-            cart = compute_cart_total(data)
-
-            item_lines = [
-                f"  {item['name']} x{item['qty']}   ₹{round(item['price'] * item['qty'])}"
-                for item in cart["items"]
-                if item["in_stock"] and item["price"]
-            ]
-
-            confirmation = (
-                "🛒 *Items added to your Zepto cart!*\n\n"
-                + "\n".join(item_lines)
-                + f"\n\n{'─' * 30}\n"
-                + f"  Cart total:   ₹{round(cart['total'])}\n"
-                + f"{'─' * 30}\n\n"
-                + "Open the Zepto app to review and place your order."
-            )
-
-            await query.message.reply_text(confirmation, parse_mode="Markdown")
-
-        except Exception as e:
-            logging.error(f"[Bot] ❌ Add to cart failed: {e}")
-            await query.message.reply_text(
-                "Couldn't add items to cart. Please check the Zepto app directly.\n"
-                f"Error: {str(e)}"
-            )
+    # Note: the price-drop alert (send_alert) is now informational only —
+    # items are already kept in the live Zepto cart from the moment they're
+    # added to the watchlist (see the "pick:" branch above), so there's no
+    # more "yes, add to cart" / "skip" button to handle here.
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
