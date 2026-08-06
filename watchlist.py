@@ -110,18 +110,33 @@ def add_sku(name: str, qty, sku_id: str) -> dict:
     return {"status": "added", "sku": new_sku}
 
 
-def remove_sku(query: str) -> dict:
-    data = load_watchlist()
-    query_lower = query.lower().strip()
-    match = next((s for s in data["skus"] if query_lower in s["name"].lower()), None)
-    if not match:
-        return {"status": "not_found", "names": [s["name"] for s in data["skus"]]}
+def _drop_matched_sku(data: dict, match: dict) -> None:
     data["skus"] = [s for s in data["skus"] if s["id"] != match["id"]]
     # Basket composition changed — historical totals are no longer comparable
     data["cart_total_history"] = []
     data["last_alerted_at"]    = None
     print(f"  [watchlist] SKU removed — cart history reset (basket changed).")
     save_watchlist(data)
+
+
+def remove_sku(query: str) -> dict:
+    """Remove by fuzzy name match — used by the /remove <text> command."""
+    data = load_watchlist()
+    query_lower = query.lower().strip()
+    match = next((s for s in data["skus"] if query_lower in s["name"].lower()), None)
+    if not match:
+        return {"status": "not_found", "names": [s["name"] for s in data["skus"]]}
+    _drop_matched_sku(data, match)
+    return {"status": "removed", "name": match["name"], "id": match["id"]}
+
+
+def remove_sku_by_id(sku_id: str) -> dict:
+    """Remove by exact productVariantId — used when a SKU is removed via the live Zepto cart."""
+    data = load_watchlist()
+    match = next((s for s in data["skus"] if s["id"] == sku_id), None)
+    if not match:
+        return {"status": "not_found"}
+    _drop_matched_sku(data, match)
     return {"status": "removed", "name": match["name"]}
 
 

@@ -1,3 +1,4 @@
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from telegram.ext import (
 from config import TELEGRAM_TOKEN, LOG_PATH
 from watchlist import (
     load_watchlist,
-    add_sku, remove_sku, compute_cart_total, get_latest_price,
+    add_sku, remove_sku, remove_sku_by_id, compute_cart_total, get_latest_price,
     get_best_previous_total,
 )
 import zepto_agent
@@ -86,6 +87,37 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 # ── /remove ───────────────────────────────────────────────────────────────────
 
+async def _remove_from_live_cart(sku_id: str, token: str) -> bool:
+    """
+    Best-effort: look up the storeProductId for a known productVariantId
+    (watchlist entries only persist the productVariantId) and zero it out
+    in the live Zepto cart. Returns False on any failure so the caller can
+    still confirm the watchlist-side removal without blocking on this.
+    """
+    try:
+        details = await zepto_agent.execute_tool_calls(
+            [{"tool": "get_product_details", "arguments": {"product_variant_id": sku_id}}], token
+        )
+        store_product_id = json.loads(details[0]["result_text"]).get("storeProductId")
+        if not store_product_id:
+            return False
+        result = await zepto_agent.execute_tool_calls([{
+            "tool": "update_cart",
+            "arguments": {
+                "deviceId": zepto_agent.DEVICE_ID,
+                "cartItems": [{
+                    "productVariantId": sku_id,
+                    "storeProductId":   store_product_id,
+                    "quantity":         0,
+                }],
+            },
+        }], token)
+        return "ERROR" not in result[0]["result_text"]
+    except Exception as e:
+        logging.error(f"[Bot] Failed to remove {sku_id} from live cart: {e}")
+        return False
+
+
 async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text(
@@ -96,16 +128,18 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = " ".join(context.args)
     result = remove_sku(query)
 
-    if result["status"] == "removed":
-        await update.message.reply_text(
-            f"Removed *{result['name']}* from your list.", parse_mode="Markdown"
-        )
-    else:
+    if result["status"] != "removed":
         names = "\n".join(f"• {n}" for n in result["names"]) or "_(empty)_"
         await update.message.reply_text(
             f"No match for _{query}_.\n\nCurrent items:\n{names}",
             parse_mode="Markdown"
         )
+        return
+
+    token   = get_cached_token()
+    cart_ok = await _remove_from_live_cart(result["id"], token)
+    suffix  = "list and Zepto cart" if cart_ok else "list (couldn't confirm removal from the Zepto cart — check the app)"
+    await update.message.reply_text(f"Removed *{result['name']}* from your {suffix}.", parse_mode="Markdown")
 
 
 # ── /status ───────────────────────────────────────────────────────────────────
@@ -184,7 +218,12 @@ async def _send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, item_
 
 
 async def _execute_cart_removal(update: Update, cart_items_to_remove: list, cart_not_found: list) -> None:
-    """Removes items from the live Zepto cart via a single batched update_cart(quantity=0) call."""
+    """
+    Removes items from the live Zepto cart via a single batched
+    update_cart(quantity=0) call, then drops the same SKUs from the
+    watchlist too (by productVariantId) — otherwise price_check.py keeps
+    tracking and alerting on an item the user just removed from their cart.
+    """
     if not cart_items_to_remove:
         lines = ["Nothing to remove — your cart may already be empty."]
         if cart_not_found:
@@ -215,7 +254,10 @@ async def _execute_cart_removal(update: Update, cart_items_to_remove: list, cart
         await update.message.reply_text("Couldn't update the cart — Zepto is busy right now, try again in a minute.")
         return
 
-    lines = ["*Removed from cart:*"] + [f"  ✅ {item['name']}" for item in cart_items_to_remove]
+    for item in cart_items_to_remove:
+        remove_sku_by_id(item["productVariantId"])
+
+    lines = ["*Removed from cart & watchlist:*"] + [f"  ✅ {item['name']}" for item in cart_items_to_remove]
     if cart_not_found:
         lines.append("\n*Not found in cart:*")
         lines += [f"  ❌ {n}" for n in cart_not_found]
