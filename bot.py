@@ -1,6 +1,9 @@
 import logging
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 import telegram
 from telegram import (
@@ -116,7 +119,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if checked != "Never":
         dt = datetime.fromisoformat(checked)
-        checked = dt.strftime("%d %b %H:%M")
+        checked = dt.astimezone(IST).strftime("%d %b %H:%M IST")
 
     current_sku_ids = sorted(s["id"] for s in data["skus"])
     previous, _ = get_best_previous_total(data, current_sku_ids, oos_names=cart["oos_items"])

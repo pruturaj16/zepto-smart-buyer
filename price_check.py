@@ -1,8 +1,11 @@
 import logging
 import requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from config import TELEGRAM_TOKEN, CHAT_ID, DROP_THRESHOLD, LOG_PATH
+
+IST = ZoneInfo("Asia/Kolkata")
 
 # File + console logging — appends to same log as bot.py
 _log_handler_file    = logging.FileHandler(LOG_PATH, encoding="utf-8")
@@ -125,7 +128,7 @@ def send_alert(
     # Human-readable baseline label
     try:
         prev_dt    = datetime.fromisoformat(previous_at)
-        prev_label = prev_dt.astimezone().strftime("%d %b %I:%M %p")
+        prev_label = prev_dt.astimezone(IST).strftime("%d %b %I:%M %p IST")
     except Exception:
         prev_label = "a previous check"
 
@@ -232,7 +235,7 @@ def run():
 
 
 def _run_price_check():
-    logging.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Starting price check...")
+    logging.info(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M IST')}] Starting price check...")
 
     pull_state()
     data = load_watchlist()
