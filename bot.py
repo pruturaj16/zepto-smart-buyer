@@ -15,6 +15,7 @@ from config import TELEGRAM_TOKEN, LOG_PATH
 from watchlist import (
     load_watchlist,
     add_sku, remove_sku, compute_cart_total, get_latest_price,
+    get_best_previous_total,
 )
 import zepto_agent
 from zepto_auth import get_valid_token as get_cached_token
@@ -57,6 +58,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── /list ─────────────────────────────────────────────────────────────────────
 
 async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pull_state()
     data = load_watchlist()
     if not data["skus"]:
         await update.message.reply_text(
@@ -106,15 +108,18 @@ async def remove_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ── /status ───────────────────────────────────────────────────────────────────
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pull_state()
     data = load_watchlist()
     cart = compute_cart_total(data)
     current  = round(cart["total"])
-    previous = data.get("previous_cart_total")
     checked  = data.get("previous_check_at", "Never")
 
     if checked != "Never":
         dt = datetime.fromisoformat(checked)
         checked = dt.strftime("%d %b %H:%M")
+
+    current_sku_ids = sorted(s["id"] for s in data["skus"])
+    previous, _ = get_best_previous_total(data, current_sku_ids, oos_names=cart["oos_items"])
 
     lines = ["*Cart status*\n", f"Last checked: {checked}", f"Current total: ₹{current}"]
 
