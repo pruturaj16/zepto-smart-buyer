@@ -187,8 +187,10 @@ def _parse_markdown_product(text: str) -> dict:
     elif re.search(r"out of stock|unavailable|not available", text, re.IGNORECASE):
         in_stock = False
     else:
-        # Default to True if stock info is present but format differs
-        in_stock = price is not None
+        # No explicit stock signal found — treat as OOS rather than silently
+        # assuming available. A false "in stock" wrongly inflates the cart
+        # total and hides genuinely OOS items from the OOS-handling flow.
+        in_stock = False
 
     return {"price": price, "in_stock": in_stock}
 
@@ -205,7 +207,8 @@ def get_product_price(sku_id: str, max_retries: int = 3) -> dict | None:
     """
     delay = 3
     try:
-        token = get_cached_token()
+        token  = get_cached_token()
+        result = None
         for attempt in range(max_retries + 1):
             result = asyncio.run(_call_tool_async("get_product_details", {"product_variant_id": sku_id}, token))
             raw    = _extract_text(result)
@@ -220,6 +223,18 @@ def get_product_price(sku_id: str, max_retries: int = 3) -> dict | None:
                 logger.error(f"[Direct] Still rate-limited fetching {sku_id} after all retries")
                 return None
             break
+
+        # Prefer the structured payload — it carries isInStock/availableQuantity
+        # directly, which is far more reliable than regex-parsing the markdown
+        # text block below (whose stock wording varies enough that OOS items
+        # were silently defaulting to "in stock" — see _parse_markdown_product).
+        structured = getattr(result, "structuredContent", None)
+        if structured and structured.get("sellingPrice") is not None:
+            return {
+                "sku_id":   sku_id,
+                "price":    structured["sellingPrice"] / 100,
+                "in_stock": bool(structured.get("isInStock")) and structured.get("availableQuantity", 0) > 0,
+            }
 
         if not raw:
             logger.error(f"[Direct] Empty response for {sku_id}")
