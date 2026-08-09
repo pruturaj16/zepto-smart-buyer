@@ -233,6 +233,14 @@ def run():
         except Exception as e:
             logging.error(f"[Metrics] write_metrics failed: {e}")
 
+        # Run pantry nudge check after every price check — piggybacking on
+        # the existing Cloud Scheduler / VM infrastructure (no extra cron needed).
+        try:
+            from pantry_check import run as pantry_run
+            pantry_run()
+        except Exception as e:
+            logging.error(f"[Pantry] pantry_check failed: {e}")
+
 
 def _run_price_check():
     logging.info(f"[{datetime.now(IST).strftime('%Y-%m-%d %H:%M IST')}] Starting price check...")
